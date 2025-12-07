@@ -4,7 +4,7 @@ use jaq_json::Val;
 
 pub fn compile(code: &str, arena: &Arena) -> Result<Filter<Native<Val>>, String> {
     let modules = Loader::new(jaq_std::defs().chain(jaq_json::defs()))
-        .load(&arena, File { code, path: "main" })
+        .load(arena, File { code, path: "main" })
         .map_err(|e| format!("unable to load: {:?}", e))?;
 
     let filter = Compiler::default()

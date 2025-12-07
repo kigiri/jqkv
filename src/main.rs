@@ -123,7 +123,7 @@ fn run_search(
             None => return None,
         };
 
-        let json = match cbor::decode(&bytes) {
+        let json = match cbor::decode(bytes) {
             Ok(v) => v,
             Err(_) => return None,
         };
@@ -158,8 +158,8 @@ async fn handle_request(
 ) -> Result<Response<Full<Bytes>>, Box<dyn std::error::Error + Send + Sync>> {
     let path = req.uri().path().to_string();
     let key = path.strip_prefix('/').unwrap_or("");
-    return match req.method() {
-        &Method::GET => {
+    match *req.method() {
+        Method::GET => {
             let prefix = if key.ends_with('/') {
                 key.as_bytes()
             } else {
@@ -171,7 +171,7 @@ async fn handle_request(
                 match val {
                     None => Ok(res(StatusCode::NOT_FOUND, "Not Found")),
                     Some(val) => {
-                        let json = cbor::decode_to_vec(&val)?;
+                        let json = cbor::decode_to_vec(val)?;
                         Ok(Response::new(Full::new(Bytes::from(json))))
                     }
                 }
@@ -184,8 +184,8 @@ async fn handle_request(
                 Ok(res(StatusCode::OK, handle.await??))
             }
         }
-        &Method::POST => {
-            if key.len() < 1 {
+        Method::POST => {
+            if key.is_empty() {
                 return Ok(res(StatusCode::BAD_REQUEST, "Missing key"));
             }
             let k = percent_decode_str(key).decode_utf8_lossy();
@@ -201,7 +201,7 @@ async fn handle_request(
             Ok(res(status, ""))
         }
         _ => Ok(res(StatusCode::METHOD_NOT_ALLOWED, "Method Not Allowed")),
-    };
+    }
 }
 
 async fn handler(
