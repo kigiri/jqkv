@@ -2,12 +2,15 @@ use std::collections::HashMap;
 use std::convert::Infallible;
 use std::io::Write;
 use std::net::SocketAddr;
+use std::pin::Pin;
 use std::sync::Arc;
+use std::task::{Context, Poll};
 use std::time::Instant;
 
+use http_body_util::combinators::BoxBody;
 use http_body_util::{BodyExt, Full};
 use hyper::StatusCode;
-use hyper::body::Bytes;
+use hyper::body::{Bytes, Frame};
 use hyper::service::service_fn;
 use hyper::{Method, Request, Response};
 use hyper_util::rt::TokioIo;
@@ -19,17 +22,83 @@ use percent_encoding::percent_decode_str;
 use serde::Deserialize;
 use serde_json::Value;
 use tokio::net::TcpListener;
+use tokio::sync::mpsc;
 use url::form_urlencoded;
 
 mod cbor;
 mod jq;
 mod lmdb;
 
-fn res(status: StatusCode, err: impl Into<Bytes>) -> Response<Full<Bytes>> {
+type RespBody = BoxBody<Bytes, Infallible>;
+
+fn res(status: StatusCode, err: impl Into<Bytes>) -> Response<RespBody> {
     let message = err.into();
-    let mut r = Response::new(Full::new(message));
+    let mut r = Response::new(Full::new(message).boxed());
     *r.status_mut() = status;
     r
+}
+
+struct ChannelBody {
+    rx: mpsc::Receiver<Bytes>,
+}
+
+impl hyper::body::Body for ChannelBody {
+    type Data = Bytes;
+    type Error = Infallible;
+
+    fn poll_frame(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
+        let this = self.get_mut();
+        match Pin::new(&mut this.rx).poll_recv(cx) {
+            Poll::Ready(Some(bytes)) => Poll::Ready(Some(Ok(Frame::data(bytes)))),
+            Poll::Ready(None) => Poll::Ready(None),
+            Poll::Pending => Poll::Pending,
+        }
+    }
+}
+
+struct StreamWriter {
+    tx: mpsc::Sender<Bytes>,
+    buf: Vec<u8>,
+    limit: usize,
+}
+
+impl StreamWriter {
+    fn new(tx: mpsc::Sender<Bytes>) -> Self {
+        let limit = 64 * 1024;
+        Self {
+            tx,
+            buf: Vec::with_capacity(limit),
+            limit,
+        }
+    }
+
+    fn emit(&mut self) -> std::io::Result<()> {
+        if self.buf.is_empty() {
+            return Ok(());
+        }
+        let out = std::mem::replace(&mut self.buf, Vec::with_capacity(self.limit));
+        self.tx.blocking_send(Bytes::from(out)).map_err(|_| {
+            std::io::Error::new(std::io::ErrorKind::BrokenPipe, "client disconnected")
+        })?;
+        Ok(())
+    }
+}
+
+impl Write for StreamWriter {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.buf.extend_from_slice(buf);
+        if self.buf.len() >= self.limit {
+            self.emit()?;
+        }
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.emit()
+    }
 }
 
 struct JsonArrayWriter<'a, W: Write> {
@@ -136,10 +205,11 @@ struct ParseBody {
     #[serde(default)]
     from: f64,
 }
+
 async fn handle_request(
     req: Request<hyper::body::Incoming>,
     db: Arc<lmdb::DB>,
-) -> Result<Response<Full<Bytes>>, Box<dyn std::error::Error + Send + Sync>> {
+) -> Result<Response<RespBody>, Box<dyn std::error::Error + Send + Sync>> {
     let path = req.uri().path().to_string();
     let key = path.strip_prefix('/').unwrap_or("");
     match *req.method() {
@@ -156,44 +226,53 @@ async fn handle_request(
                     None => Ok(res(StatusCode::NOT_FOUND, "Not Found")),
                     Some(val) => {
                         let json = cbor::decode_to_vec(val)?;
-                        Ok(Response::new(Full::new(Bytes::from(json))))
+                        Ok(Response::new(Full::new(Bytes::from(json)).boxed()))
                     }
                 }
             } else {
                 let search = req.uri().query().unwrap_or("").to_string();
                 let prefix_bytes = Bytes::copy_from_slice(prefix);
-                let handle = tokio::task::spawn_blocking(
-                    move || -> Result<Bytes, Box<dyn std::error::Error + Send + Sync>> {
-                        let params: HashMap<String, String> =
-                            form_urlencoded::parse(search.as_bytes())
-                                .map(|(k, v)| (k.into_owned(), v.into_owned()))
-                                .collect();
+                let (tx, rx) = mpsc::channel::<Bytes>(32);
 
-                        let query =
-                            normalize_query(params.get("q").map(|s| s.as_str()).unwrap_or("."));
+                tokio::task::spawn_blocking(move || {
+                    let params: HashMap<String, String> = form_urlencoded::parse(search.as_bytes())
+                        .map(|(k, v)| (k.into_owned(), v.into_owned()))
+                        .collect();
 
-                        let from: f64 = params
-                            .get("from")
-                            .and_then(|s| s.parse().ok())
-                            .unwrap_or(0.0);
+                    let query = normalize_query(params.get("q").map(|s| s.as_str()).unwrap_or("."));
 
-                        let arena = Arena::default();
-                        let filter = jq::compile(&query, &arena)?;
-                        let mut output = Vec::with_capacity(4096);
-                        let mut arr = JsonArrayWriter::new(&mut output)?;
-                        run_search(db.clone(), prefix_bytes, from, &filter, &mut arr)?;
-                        arr.finish()?;
-                        Ok(Bytes::from(output))
-                    },
-                );
-                Ok(res(StatusCode::OK, handle.await??))
+                    let from: f64 = params
+                        .get("from")
+                        .and_then(|s| s.parse().ok())
+                        .unwrap_or(0.0);
+
+                    let arena = Arena::default();
+                    let filter = match jq::compile(&query, &arena) {
+                        Ok(f) => f,
+                        Err(_) => {
+                            let _ = tx.blocking_send(Bytes::from_static(b"[]"));
+                            return;
+                        }
+                    };
+
+                    let mut output = StreamWriter::new(tx);
+                    let mut arr = match JsonArrayWriter::new(&mut output) {
+                        Ok(a) => a,
+                        Err(_) => return,
+                    };
+
+                    let _ = run_search(db.clone(), prefix_bytes, from, &filter, &mut arr);
+                    let _ = arr.finish();
+                    let _ = output.flush();
+                });
+
+                Ok(Response::new(ChannelBody { rx }.boxed()))
             }
         }
         Method::POST => {
             let c = req.into_body().collect().await?;
             let body = c.to_bytes();
             if key.is_empty() {
-                // decode body
                 let deserialized = serde_json::from_slice::<ParseBody>(&body);
                 let parsed = match deserialized {
                     Ok(p) => p,
@@ -205,28 +284,44 @@ async fn handle_request(
                     }
                 };
 
-                let handle = tokio::task::spawn_blocking(
-                    move || -> Result<Bytes, Box<dyn std::error::Error + Send + Sync>> {
-                        let mut output = Vec::with_capacity(4096);
-                        let mut arr = JsonArrayWriter::new(&mut output)?;
-                        let query = normalize_query(&parsed.query);
-                        let arena = Arena::default();
-                        let filter = jq::compile(&query, &arena)?;
-                        for prefix in parsed.prefixes {
-                            let db = db.clone();
-                            run_search(
-                                db,
-                                Bytes::copy_from_slice(prefix.as_bytes()),
-                                parsed.from,
-                                &filter,
-                                &mut arr,
-                            )?;
+                let (tx, rx) = mpsc::channel::<Bytes>(32);
+
+                tokio::task::spawn_blocking(move || {
+                    let query = normalize_query(&parsed.query);
+                    let arena = Arena::default();
+                    let filter = match jq::compile(&query, &arena) {
+                        Ok(f) => f,
+                        Err(_) => {
+                            let _ = tx.blocking_send(Bytes::from_static(b"[]"));
+                            return;
                         }
-                        arr.finish()?;
-                        Ok(Bytes::from(output))
-                    },
-                );
-                return Ok(res(StatusCode::OK, handle.await??));
+                    };
+
+                    let mut output = StreamWriter::new(tx);
+                    let mut arr = match JsonArrayWriter::new(&mut output) {
+                        Ok(a) => a,
+                        Err(_) => return,
+                    };
+
+                    for prefix in parsed.prefixes {
+                        if run_search(
+                            db.clone(),
+                            Bytes::copy_from_slice(prefix.as_bytes()),
+                            parsed.from,
+                            &filter,
+                            &mut arr,
+                        )
+                        .is_err()
+                        {
+                            break;
+                        }
+                    }
+
+                    let _ = arr.finish();
+                    let _ = output.flush();
+                });
+
+                return Ok(Response::new(ChannelBody { rx }.boxed()));
             }
             let k = percent_decode_str(key).decode_utf8_lossy();
             let bytes = cbor::encode(&body)?;
@@ -253,7 +348,7 @@ async fn handle_request(
 async fn handler(
     req: Request<hyper::body::Incoming>,
     db: Arc<lmdb::DB>,
-) -> Result<Response<Full<Bytes>>, Infallible> {
+) -> Result<Response<RespBody>, Infallible> {
     let start = Instant::now();
     match handle_request(req, db).await {
         Ok(r) => {
