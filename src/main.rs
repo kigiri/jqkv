@@ -200,6 +200,14 @@ async fn handle_request(
             };
             Ok(res(status, ""))
         }
+        Method::DELETE => {
+            if key.is_empty() {
+                return Ok(res(StatusCode::BAD_REQUEST, "Missing key"));
+            }
+            let k = percent_decode_str(key).decode_utf8_lossy();
+            let _ = lmdb::delete_entry(&db, k.as_ref().as_bytes())?;
+            Ok(res(StatusCode::NO_CONTENT, ""))
+        }
         _ => Ok(res(StatusCode::METHOD_NOT_ALLOWED, "Method Not Allowed")),
     }
 }

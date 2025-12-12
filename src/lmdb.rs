@@ -69,6 +69,17 @@ pub fn update_entry(
     Ok(now)
 }
 
+pub fn delete_entry(
+    db: &DB,
+    key: &[u8],
+) -> Result<u64, Box<dyn std::error::Error + Send + Sync + 'static>> {
+    let mut wtxn = db.env.write_txn()?;
+    db.data.delete(&mut wtxn, key)?;
+    db.meta.delete(&mut wtxn, key)?;
+    wtxn.commit()?;
+    Ok(1)
+}
+
 impl BytesEncode<'_> for RawKeyCodec {
     type EItem = [u8];
 
