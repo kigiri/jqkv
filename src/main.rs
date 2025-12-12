@@ -16,6 +16,7 @@ use jaq_core::Ctx;
 use jaq_core::load::Arena;
 use jaq_json::Val;
 use percent_encoding::percent_decode_str;
+use serde::Deserialize;
 use serde_json::Value;
 use tokio::net::TcpListener;
 use url::form_urlencoded;
@@ -31,84 +32,55 @@ fn res(status: StatusCode, err: impl Into<Bytes>) -> Response<Full<Bytes>> {
     r
 }
 
-fn collect_results_to_json_array<I>(
-    mut results: I,
-    limit: usize,
-) -> Result<Bytes, Box<dyn std::error::Error + Send + Sync>>
-where
-    I: Iterator<Item = Result<Val, jaq_core::Error<Val>>>,
-{
-    // Collect up to limit+1 items so we know if there's more than one
-    let mut vals = Vec::new();
-    for item in results.by_ref().take(limit + 1) {
-        let Ok(v) = item else { continue };
-        vals.push(v);
-        if vals.len() > limit {
-            break;
-        }
-    }
-
-    let mut output = Vec::with_capacity(4096);
-
-    match vals.len() {
-        0 => {
-            output.extend_from_slice(b"[]");
-        }
-        1 => {
-            write!(&mut output, "{}", vals[0])?;
-        }
-        _ => {
-            output.push(b'[');
-            let mut first = true;
-            for v in vals.into_iter().take(limit) {
-                if !first {
-                    output.push(b',');
-                }
-                first = false;
-                write!(&mut output, "{}", v)?;
-            }
-            output.push(b']');
-        }
-    }
-
-    Ok(Bytes::from(output))
+struct JsonArrayWriter<'a, W: Write> {
+    out: &'a mut W,
+    first: bool,
 }
 
-fn run_search(
-    db: Arc<lmdb::DB>,
-    prefix: Bytes,
-    search: String,
-) -> Result<Bytes, Box<dyn std::error::Error + Send + Sync>> {
-    let params: HashMap<String, String> = form_urlencoded::parse(search.as_bytes())
-        .map(|(k, v)| (k.into_owned(), v.into_owned()))
-        .collect();
-
-    let mut query = params
-        .get("q")
-        .map(|s| s.as_str())
-        .unwrap_or(".")
-        .to_string();
-
-    if !query.contains("inputs") {
-        query = format!("inputs | {}", query);
+impl<'a, W: Write> JsonArrayWriter<'a, W> {
+    fn new(out: &'a mut W) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
+        out.write_all(b"[")?;
+        Ok(Self { out, first: true })
     }
 
-    let arena = Arena::default();
-    let filter = jq::compile(&query, &arena)?;
-    let from: f64 = params
-        .get("from")
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(0.0);
-    let limit: usize = params
-        .get("limit")
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(100)
-        .min(1000);
+    fn push_val(&mut self, v: Val) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        if self.first {
+            self.first = false;
+        } else {
+            self.out.write_all(b",")?;
+        }
+        write!(self.out, "{}", v)?;
+        Ok(())
+    }
 
+    fn finish(self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        self.out.write_all(b"]")?;
+        Ok(())
+    }
+}
+
+fn normalize_query(query: &str) -> String {
+    if query.contains("inputs") {
+        query.to_string()
+    } else {
+        format!("inputs | {}", query)
+    }
+}
+
+fn run_search<W, F>(
+    db: Arc<lmdb::DB>,
+    prefix: Bytes,
+    from: f64,
+    filter: &jaq_core::Filter<F>,
+    out: &mut JsonArrayWriter<'_, W>,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>>
+where
+    F: jaq_core::FilterT<V = Val>,
+    W: Write,
+{
     let txn = db.env.read_txn()?;
     let iter = db.meta.prefix_iter(&txn, &prefix)?;
     let max = (from * 1_000_000.0) as u64;
-
     let row_iter = iter.flatten().filter_map(|(k, at)| {
         if at < max {
             return None;
@@ -149,9 +121,21 @@ fn run_search(
 
     let inputs = jaq_core::RcIter::new(row_iter);
     let results = filter.run((Ctx::new([], &inputs), Val::Null));
-    collect_results_to_json_array(results, limit)
+    for item in results {
+        if let Ok(v) = item {
+            out.push_val(v)?
+        }
+    }
+    Ok(())
 }
 
+#[derive(Deserialize, Debug)]
+struct ParseBody {
+    prefixes: Vec<String>,
+    query: String,
+    #[serde(default)]
+    from: f64,
+}
 async fn handle_request(
     req: Request<hyper::body::Incoming>,
     db: Arc<lmdb::DB>,
@@ -178,19 +162,73 @@ async fn handle_request(
             } else {
                 let search = req.uri().query().unwrap_or("").to_string();
                 let prefix_bytes = Bytes::copy_from_slice(prefix);
-                let handle = tokio::task::spawn_blocking(move || {
-                    run_search(db.clone(), prefix_bytes, search)
-                });
+                let handle = tokio::task::spawn_blocking(
+                    move || -> Result<Bytes, Box<dyn std::error::Error + Send + Sync>> {
+                        let params: HashMap<String, String> =
+                            form_urlencoded::parse(search.as_bytes())
+                                .map(|(k, v)| (k.into_owned(), v.into_owned()))
+                                .collect();
+
+                        let query =
+                            normalize_query(params.get("q").map(|s| s.as_str()).unwrap_or("."));
+
+                        let from: f64 = params
+                            .get("from")
+                            .and_then(|s| s.parse().ok())
+                            .unwrap_or(0.0);
+
+                        let arena = Arena::default();
+                        let filter = jq::compile(&query, &arena)?;
+                        let mut output = Vec::with_capacity(4096);
+                        let mut arr = JsonArrayWriter::new(&mut output)?;
+                        run_search(db.clone(), prefix_bytes, from, &filter, &mut arr)?;
+                        arr.finish()?;
+                        Ok(Bytes::from(output))
+                    },
+                );
                 Ok(res(StatusCode::OK, handle.await??))
             }
         }
         Method::POST => {
-            if key.is_empty() {
-                return Ok(res(StatusCode::BAD_REQUEST, "Missing key"));
-            }
-            let k = percent_decode_str(key).decode_utf8_lossy();
             let c = req.into_body().collect().await?;
             let body = c.to_bytes();
+            if key.is_empty() {
+                // decode body
+                let deserialized = serde_json::from_slice::<ParseBody>(&body);
+                let parsed = match deserialized {
+                    Ok(p) => p,
+                    Err(e) => {
+                        return Ok(res(
+                            StatusCode::BAD_REQUEST,
+                            format!("Unable to parse JSON body: {:?}", e),
+                        ));
+                    }
+                };
+
+                let handle = tokio::task::spawn_blocking(
+                    move || -> Result<Bytes, Box<dyn std::error::Error + Send + Sync>> {
+                        let mut output = Vec::with_capacity(4096);
+                        let mut arr = JsonArrayWriter::new(&mut output)?;
+                        let query = normalize_query(&parsed.query);
+                        let arena = Arena::default();
+                        let filter = jq::compile(&query, &arena)?;
+                        for prefix in parsed.prefixes {
+                            let db = db.clone();
+                            run_search(
+                                db,
+                                Bytes::copy_from_slice(prefix.as_bytes()),
+                                parsed.from,
+                                &filter,
+                                &mut arr,
+                            )?;
+                        }
+                        arr.finish()?;
+                        Ok(Bytes::from(output))
+                    },
+                );
+                return Ok(res(StatusCode::OK, handle.await??));
+            }
+            let k = percent_decode_str(key).decode_utf8_lossy();
             let bytes = cbor::encode(&body)?;
             let count = lmdb::update_entry(&db, k.as_ref().as_bytes(), &bytes, None)?;
             let status = if count == 0 {

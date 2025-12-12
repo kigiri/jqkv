@@ -922,6 +922,7 @@ dependencies = [
  "lz4",
  "minicbor-serde",
  "percent-encoding",
+ "serde",
  "serde_json",
  "tokio",
  "url",
