@@ -30,6 +30,8 @@ mod jq;
 mod lmdb;
 
 type RespBody = BoxBody<Bytes, Infallible>;
+type BoxError = Box<dyn std::error::Error + Send + Sync>;
+type AppResult<T> = std::result::Result<T, BoxError>;
 
 fn res(status: StatusCode, err: impl Into<Bytes>) -> Response<RespBody> {
     let message = err.into();
@@ -107,12 +109,12 @@ struct JsonArrayWriter<'a, W: Write> {
 }
 
 impl<'a, W: Write> JsonArrayWriter<'a, W> {
-    fn new(out: &'a mut W) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
+    fn new(out: &'a mut W) -> AppResult<Self> {
         out.write_all(b"[")?;
         Ok(Self { out, first: true })
     }
 
-    fn push_val(&mut self, v: Val) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    fn push_val(&mut self, v: Val) -> AppResult<()> {
         if self.first {
             self.first = false;
         } else {
@@ -122,7 +124,7 @@ impl<'a, W: Write> JsonArrayWriter<'a, W> {
         Ok(())
     }
 
-    fn finish(self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    fn finish(self) -> AppResult<()> {
         self.out.write_all(b"]")?;
         Ok(())
     }
@@ -142,7 +144,7 @@ fn run_search<W, F>(
     from: f64,
     filter: &jaq_core::Filter<F>,
     out: &mut JsonArrayWriter<'_, W>,
-) -> Result<(), Box<dyn std::error::Error + Send + Sync>>
+) -> AppResult<()>
 where
     F: jaq_core::FilterT<V = Val>,
     W: Write,
@@ -209,7 +211,7 @@ struct ParseBody {
 async fn handle_request(
     req: Request<hyper::body::Incoming>,
     db: Arc<lmdb::DB>,
-) -> Result<Response<RespBody>, Box<dyn std::error::Error + Send + Sync>> {
+) -> AppResult<Response<RespBody>> {
     let path = req.uri().path().to_string();
     let key = path.strip_prefix('/').unwrap_or("");
     match *req.method() {
@@ -385,7 +387,7 @@ where
 }
 
 #[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+async fn main() -> AppResult<()> {
     let db = Arc::new(lmdb::DB::new().expect("Unable to init the database"));
     let addr = SocketAddr::from(([127, 0, 0, 1], 3000));
     let listener = TcpListener::bind(addr).await?;
