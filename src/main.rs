@@ -11,6 +11,7 @@ use http_body_util::combinators::BoxBody;
 use http_body_util::{BodyExt, Full};
 use hyper::StatusCode;
 use hyper::body::{Bytes, Frame};
+use hyper::header::CONTENT_TYPE;
 use hyper::service::service_fn;
 use hyper::{Method, Request, Response};
 use hyper_util::rt::TokioIo;
@@ -20,7 +21,7 @@ use jaq_core::load::Arena;
 use jaq_json::Val;
 use percent_encoding::percent_decode_str;
 use serde::Deserialize;
-use serde_json::Value;
+use serde_json::{Value, json};
 use tokio::net::TcpListener;
 use tokio::sync::mpsc;
 use url::form_urlencoded;
@@ -33,10 +34,80 @@ type RespBody = BoxBody<Bytes, Infallible>;
 type BoxError = Box<dyn std::error::Error + Send + Sync>;
 type AppResult<T> = std::result::Result<T, BoxError>;
 
-fn res(status: StatusCode, err: impl Into<Bytes>) -> Response<RespBody> {
-    let message = err.into();
+#[derive(Debug)]
+enum ApiError {
+    NotFound,
+    BadRequest(String),
+    InvalidQuery(String),
+    Internal(String),
+    MethodNotAllowed,
+    MissingKey,
+}
+
+impl ApiError {
+    fn status(&self) -> StatusCode {
+        match self {
+            ApiError::NotFound => StatusCode::NOT_FOUND,
+            ApiError::BadRequest(_) => StatusCode::BAD_REQUEST,
+            ApiError::InvalidQuery(_) => StatusCode::BAD_REQUEST,
+            ApiError::Internal(_) => StatusCode::INTERNAL_SERVER_ERROR,
+            ApiError::MethodNotAllowed => StatusCode::METHOD_NOT_ALLOWED,
+            ApiError::MissingKey => StatusCode::BAD_REQUEST,
+        }
+    }
+
+    fn code(&self) -> &'static str {
+        match self {
+            ApiError::NotFound => "not_found",
+            ApiError::BadRequest(_) => "bad_request",
+            ApiError::InvalidQuery(_) => "invalid_query",
+            ApiError::Internal(_) => "internal_error",
+            ApiError::MethodNotAllowed => "method_not_allowed",
+            ApiError::MissingKey => "missing_key",
+        }
+    }
+
+    fn message(&self) -> &str {
+        match self {
+            ApiError::NotFound => "Not Found",
+            ApiError::BadRequest(msg) => msg,
+            ApiError::InvalidQuery(msg) => msg,
+            ApiError::Internal(msg) => msg,
+            ApiError::MethodNotAllowed => "Method Not Allowed",
+            ApiError::MissingKey => "Missing key",
+        }
+    }
+}
+
+fn res_json(status: StatusCode, body: impl Into<Bytes>) -> Response<RespBody> {
+    let message = body.into();
     let mut r = Response::new(Full::new(message).boxed());
     *r.status_mut() = status;
+    r.headers_mut()
+        .insert(CONTENT_TYPE, "application/json; charset=utf-8".parse().unwrap());
+    r
+}
+
+fn res_error(err: ApiError) -> Response<RespBody> {
+    let payload = json!({
+        "error": err.message(),
+        "code": err.code(),
+    });
+    let body = serde_json::to_vec(&payload).unwrap_or_else(|_| {
+        b"{\"error\":\"Internal error\",\"code\":\"internal_error\"}".to_vec()
+    });
+    res_json(err.status(), Bytes::from(body))
+}
+
+fn res_empty(status: StatusCode) -> Response<RespBody> {
+    let mut r = Response::new(Full::new(Bytes::new()).boxed());
+    *r.status_mut() = status;
+    r
+}
+
+fn set_json_header(mut r: Response<RespBody>) -> Response<RespBody> {
+    r.headers_mut()
+        .insert(CONTENT_TYPE, "application/json; charset=utf-8".parse().unwrap());
     r
 }
 
@@ -192,10 +263,8 @@ where
 
     let inputs = jaq_core::RcIter::new(row_iter);
     let results = filter.run((Ctx::new([], &inputs), Val::Null));
-    for item in results {
-        if let Ok(v) = item {
-            out.push_val(v)?
-        }
+    for v in results.flatten() {
+        out.push_val(v)?
     }
     Ok(())
 }
@@ -225,23 +294,26 @@ async fn handle_request(
                 let txn = db.env.read_txn()?;
                 let val = db.data.get(&txn, key.as_bytes())?;
                 match val {
-                    None => Ok(res(StatusCode::NOT_FOUND, "Not Found")),
+                    None => Ok(res_error(ApiError::NotFound)),
                     Some(val) => {
                         let json = cbor::decode_to_vec(val)?;
-                        Ok(Response::new(Full::new(Bytes::from(json)).boxed()))
+                        Ok(res_json(StatusCode::OK, Bytes::from(json)))
                     }
                 }
             } else {
                 let search = req.uri().query().unwrap_or("").to_string();
                 let prefix_bytes = Bytes::copy_from_slice(prefix);
+
                 let (tx, rx) = mpsc::channel::<Bytes>(32);
 
                 tokio::task::spawn_blocking(move || {
-                    let params: HashMap<String, String> = form_urlencoded::parse(search.as_bytes())
-                        .map(|(k, v)| (k.into_owned(), v.into_owned()))
-                        .collect();
+                    let params: HashMap<String, String> =
+                        form_urlencoded::parse(search.as_bytes())
+                            .map(|(k, v)| (k.into_owned(), v.into_owned()))
+                            .collect();
 
-                    let query = normalize_query(params.get("q").map(|s| s.as_str()).unwrap_or("."));
+                    let query =
+                        normalize_query(params.get("q").map(|s| s.as_str()).unwrap_or("."));
 
                     let from: f64 = params
                         .get("from")
@@ -251,8 +323,17 @@ async fn handle_request(
                     let arena = Arena::default();
                     let filter = match jq::compile(&query, &arena) {
                         Ok(f) => f,
-                        Err(_) => {
-                            let _ = tx.blocking_send(Bytes::from_static(b"[]"));
+                        Err(err) => {
+                            let api_err = ApiError::InvalidQuery(err);
+                            let payload = json!({
+                                "error": api_err.message(),
+                                "code": api_err.code(),
+                            });
+                            let body = serde_json::to_vec(&payload).unwrap_or_else(|_| {
+                                b"{\"error\":\"Internal error\",\"code\":\"internal_error\"}"
+                                    .to_vec()
+                            });
+                            let _ = tx.blocking_send(Bytes::from(body));
                             return;
                         }
                     };
@@ -268,7 +349,7 @@ async fn handle_request(
                     let _ = output.flush();
                 });
 
-                Ok(Response::new(ChannelBody { rx }.boxed()))
+                Ok(set_json_header(Response::new(ChannelBody { rx }.boxed())))
             }
         }
         Method::POST => {
@@ -279,10 +360,10 @@ async fn handle_request(
                 let parsed = match deserialized {
                     Ok(p) => p,
                     Err(e) => {
-                        return Ok(res(
-                            StatusCode::BAD_REQUEST,
-                            format!("Unable to parse JSON body: {:?}", e),
-                        ));
+                        return Ok(res_error(ApiError::BadRequest(format!(
+                            "Unable to parse JSON body: {:?}",
+                            e
+                        ))));
                     }
                 };
 
@@ -293,8 +374,17 @@ async fn handle_request(
                     let arena = Arena::default();
                     let filter = match jq::compile(&query, &arena) {
                         Ok(f) => f,
-                        Err(_) => {
-                            let _ = tx.blocking_send(Bytes::from_static(b"[]"));
+                        Err(err) => {
+                            let api_err = ApiError::InvalidQuery(err);
+                            let payload = json!({
+                                "error": api_err.message(),
+                                "code": api_err.code(),
+                            });
+                            let body = serde_json::to_vec(&payload).unwrap_or_else(|_| {
+                                b"{\"error\":\"Internal error\",\"code\":\"internal_error\"}"
+                                    .to_vec()
+                            });
+                            let _ = tx.blocking_send(Bytes::from(body));
                             return;
                         }
                     };
@@ -323,7 +413,7 @@ async fn handle_request(
                     let _ = output.flush();
                 });
 
-                return Ok(Response::new(ChannelBody { rx }.boxed()));
+                return Ok(set_json_header(Response::new(ChannelBody { rx }.boxed())));
             }
             let k = percent_decode_str(key).decode_utf8_lossy();
             let bytes = cbor::encode(&body)?;
@@ -333,17 +423,17 @@ async fn handle_request(
             } else {
                 StatusCode::NO_CONTENT
             };
-            Ok(res(status, ""))
+            Ok(res_empty(status))
         }
         Method::DELETE => {
             if key.is_empty() {
-                return Ok(res(StatusCode::BAD_REQUEST, "Missing key"));
+                return Ok(res_error(ApiError::MissingKey));
             }
             let k = percent_decode_str(key).decode_utf8_lossy();
             let _ = lmdb::delete_entry(&db, k.as_ref().as_bytes())?;
-            Ok(res(StatusCode::NO_CONTENT, ""))
+            Ok(res_empty(StatusCode::NO_CONTENT))
         }
-        _ => Ok(res(StatusCode::METHOD_NOT_ALLOWED, "Method Not Allowed")),
+        _ => Ok(res_error(ApiError::MethodNotAllowed)),
     }
 }
 
@@ -368,7 +458,7 @@ async fn handler(
                 (start.elapsed().as_micros() as f64) / 1000.0,
                 message
             );
-            Ok(res(StatusCode::INTERNAL_SERVER_ERROR, message))
+            Ok(res_error(ApiError::Internal(message)))
         }
     }
 }
