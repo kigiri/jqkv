@@ -24,6 +24,7 @@ use url::form_urlencoded;
 mod cbor;
 mod jq;
 mod lmdb;
+mod streaming;
 mod service;
 
 type RespBody = BoxBody<Bytes, Infallible>;
