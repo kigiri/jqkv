@@ -26,6 +26,12 @@ pub struct DB {
 impl DB {
     pub fn new() -> Result<Self, Box<dyn std::error::Error + Send + Sync + 'static>> {
         let path = Path::new("cache");
+        Self::new_with_path(path)
+    }
+
+    pub fn new_with_path(
+        path: &Path,
+    ) -> Result<Self, Box<dyn std::error::Error + Send + Sync + 'static>> {
         create_dir_all(path)?;
         let env = unsafe {
             EnvOpenOptions::new()

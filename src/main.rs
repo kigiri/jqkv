@@ -6,6 +6,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
 use std::time::Instant;
+use std::path::Path;
 
 use http_body_util::combinators::BoxBody;
 use http_body_util::{BodyExt, Full};
@@ -494,7 +495,13 @@ where
 
 #[tokio::main]
 async fn main() -> AppResult<()> {
-    let db = Arc::new(lmdb::DB::new().expect("Unable to init the database"));
+    let db_path = std::env::var("STORE_DB_PATH").ok();
+    let db = match db_path.as_deref() {
+        Some(path) => Arc::new(
+            lmdb::DB::new_with_path(Path::new(path)).expect("Unable to init the database"),
+        ),
+        None => Arc::new(lmdb::DB::new().expect("Unable to init the database")),
+    };
     let addr = SocketAddr::from(([127, 0, 0, 1], 3000));
     let listener = TcpListener::bind(addr).await?;
     loop {
