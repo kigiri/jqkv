@@ -6,10 +6,9 @@ use jaq_core::Ctx;
 use jaq_core::load::Arena;
 use jaq_json::Val;
 use serde_json::Value;
-use tokio::sync::{mpsc, oneshot};
 
 use crate::{cbor, jq, lmdb};
-use crate::streaming::{JsonArrayWriter, StreamWriter};
+use crate::streaming::JsonArrayWriter;
 
 #[derive(Debug)]
 pub enum ApiError {
@@ -24,11 +23,6 @@ pub enum ApiError {
 pub enum UpdateResult {
     Unchanged,
     Updated,
-}
-
-pub struct StreamHandle {
-    pub status_rx: oneshot::Receiver<Result<(), ApiError>>,
-    pub rx: mpsc::Receiver<Bytes>,
 }
 
 pub fn get_value_json(db: &lmdb::DB, key: &[u8]) -> Result<Option<Vec<u8>>, ApiError> {
@@ -68,44 +62,29 @@ pub fn delete_value(db: &lmdb::DB, key: &[u8]) -> Result<(), ApiError> {
     Ok(())
 }
 
-pub fn start_query(
+pub fn run_query_streaming<W, F>(
     db: Arc<lmdb::DB>,
     prefixes: Vec<Bytes>,
     query: String,
     from: f64,
-) -> StreamHandle {
-    let (tx, rx) = mpsc::channel::<Bytes>(32);
-    let (status_tx, status_rx) = oneshot::channel::<Result<(), ApiError>>();
+    out: &mut W,
+    on_ready: F,
+) -> Result<(), ApiError>
+where
+    W: Write,
+    F: FnOnce(),
+{
+    let query = normalize_query(&query);
+    let arena = Arena::default();
+    let filter = jq::compile(&query, &arena).map_err(ApiError::InvalidQuery)?;
+    on_ready();
 
-    tokio::task::spawn_blocking(move || {
-        let query = normalize_query(&query);
-        let arena = Arena::default();
-        let filter = match jq::compile(&query, &arena) {
-            Ok(f) => f,
-            Err(err) => {
-                let _ = status_tx.send(Err(ApiError::InvalidQuery(err)));
-                return;
-            }
-        };
-        let _ = status_tx.send(Ok(()));
-
-        let mut output = StreamWriter::new(tx);
-        let mut arr = match JsonArrayWriter::new(&mut output) {
-            Ok(a) => a,
-            Err(_) => return,
-        };
-
-        for prefix in prefixes {
-            if run_search(db.clone(), prefix, from, &filter, &mut arr).is_err() {
-                break;
-            }
-        }
-
-        let _ = arr.finish();
-        let _ = output.flush();
-    });
-
-    StreamHandle { status_rx, rx }
+    let mut arr = JsonArrayWriter::new(out)?;
+    for prefix in prefixes {
+        run_search(db.clone(), prefix, from, &filter, &mut arr)?;
+    }
+    arr.finish()?;
+    Ok(())
 }
 
 

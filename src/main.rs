@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::convert::Infallible;
 use std::net::SocketAddr;
+use std::io::Write;
 use std::path::Path;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -19,6 +20,7 @@ use percent_encoding::percent_decode_str;
 use serde::Deserialize;
 use serde_json::json;
 use tokio::net::TcpListener;
+use tokio::sync::{mpsc, oneshot};
 use url::form_urlencoded;
 
 mod cbor;
@@ -103,13 +105,7 @@ fn res_json(status: StatusCode, body: impl Into<Bytes>) -> Response<RespBody> {
 }
 
 fn res_error(err: service::ApiError) -> Response<RespBody> {
-    let payload = json!({
-        "error": error_message(&err),
-        "code": error_code(&err),
-    });
-    let body = serde_json::to_vec(&payload).unwrap_or_else(|_| {
-        b"{\"error\":\"Internal error\",\"code\":\"internal_error\"}".to_vec()
-    });
+    let body = error_body(&err);
     res_json(error_status(&err), Bytes::from(body))
 }
 
@@ -125,10 +121,63 @@ fn set_json_header(mut r: Response<RespBody>) -> Response<RespBody> {
     r
 }
 
+fn error_body(err: &service::ApiError) -> Vec<u8> {
+    let payload = json!({
+        "error": error_message(err),
+        "code": error_code(err),
+    });
+    serde_json::to_vec(&payload).unwrap_or_else(|_| {
+        b"{\"error\":\"Internal error\",\"code\":\"internal_error\"}".to_vec()
+    })
+}
+
 fn handle_service_error(err: service::ApiError) -> Result<Response<RespBody>, service::ApiError> {
     match err {
         service::ApiError::Internal(_) => Err(err),
         _ => Ok(res_error(err)),
+    }
+}
+
+async fn run_streamed_query(
+    db: Arc<lmdb::DB>,
+    prefixes: Vec<Bytes>,
+    query: String,
+    from: f64,
+) -> Result<Response<RespBody>, service::ApiError> {
+    let (tx, rx) = mpsc::channel::<Bytes>(32);
+    let (status_tx, status_rx) = oneshot::channel::<Result<(), service::ApiError>>();
+
+    tokio::task::spawn_blocking(move || {
+        let mut output = streaming::StreamWriter::new(tx);
+        let mut status_tx = Some(status_tx);
+        let result = service::run_query_streaming(
+            db.clone(),
+            prefixes,
+            query,
+            from,
+            &mut output,
+            || {
+                if let Some(tx) = status_tx.take() {
+                    let _ = tx.send(Ok(()));
+                }
+            },
+        );
+        if let Err(err) = result {
+            if let Some(tx) = status_tx.take() {
+                let body = error_body(&err);
+                let _ = tx.send(Err(err));
+                let _ = output.write_all(&body);
+                let _ = output.flush();
+            }
+        } else {
+            let _ = output.flush();
+        }
+    });
+
+    match status_rx.await {
+        Ok(Ok(())) => Ok(set_json_header(Response::new(ChannelBody { rx }.boxed()))),
+        Ok(Err(err)) => handle_service_error(err),
+        Err(_) => Err(service::ApiError::Internal("worker error".to_string())),
     }
 }
 
@@ -156,20 +205,14 @@ async fn handle_request(
                 let params: HashMap<String, String> = form_urlencoded::parse(search.as_bytes())
                     .map(|(k, v)| (k.into_owned(), v.into_owned()))
                     .collect();
-                let query = params.get("q").map(|s| s.as_str()).unwrap_or(".");
+                let query = params.get("q").cloned().unwrap_or_else(|| ".".to_string());
                 let from: f64 = params
                     .get("from")
                     .and_then(|s| s.parse().ok())
                     .unwrap_or(0.0);
 
                 let prefix_bytes = Bytes::copy_from_slice(prefix);
-                let stream = service::start_query(db.clone(), vec![prefix_bytes], query.to_string(), from);
-
-                match stream.status_rx.await {
-                    Ok(Ok(())) => Ok(set_json_header(Response::new(ChannelBody { rx: stream.rx }.boxed()))),
-                    Ok(Err(err)) => handle_service_error(err),
-                    Err(_) => Err(service::ApiError::Internal("worker error".to_string())),
-                }
+                run_streamed_query(db.clone(), vec![prefix_bytes], query, from).await
             }
         }
         Method::POST => {
@@ -196,12 +239,7 @@ async fn handle_request(
                     .map(|p| Bytes::copy_from_slice(p.as_bytes()))
                     .collect::<Vec<_>>();
 
-                let stream = service::start_query(db.clone(), prefixes, parsed.query, parsed.from);
-                return match stream.status_rx.await {
-                    Ok(Ok(())) => Ok(set_json_header(Response::new(ChannelBody { rx: stream.rx }.boxed()))),
-                    Ok(Err(err)) => handle_service_error(err),
-                    Err(_) => Err(service::ApiError::Internal("worker error".to_string())),
-                };
+                return run_streamed_query(db.clone(), prefixes, parsed.query, parsed.from).await;
             }
             let k = percent_decode_str(key).decode_utf8_lossy();
             let update = match service::update_value(&db, k.as_ref().as_bytes(), &body) {
