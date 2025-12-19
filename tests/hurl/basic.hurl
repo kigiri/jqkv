@@ -43,6 +43,15 @@ Content-Type: application/json
 }
 HTTP 204
 
+POST http://127.0.0.1:3000/org/acme/user/5
+Content-Type: application/json
+{
+  "name": "erin",
+  "role": "member",
+  "score": 5
+}
+HTTP 204
+
 POST http://127.0.0.1:3000/org/acme/group/ops
 Content-Type: application/json
 {
@@ -85,6 +94,50 @@ HTTP 200
 [Asserts]
 jsonpath "$[0]" == "org/acme/group/ops"
 
+# Unchanged update should return 304
+POST http://127.0.0.1:3000/org/acme/user/5
+Content-Type: application/json
+{
+  "name": "erin",
+  "role": "member",
+  "score": 5
+}
+HTTP 304
+
+# Capture timestamp before update
+POST http://127.0.0.1:3000/
+Content-Type: application/json
+{
+  "prefixes": ["org/acme/user/"],
+  "query": "inputs | select(._key == \"org/acme/user/5\") | ._at",
+  "from": 0
+}
+HTTP 200
+[Captures]
+user5_before: jsonpath "$[0]"
+
+# Updated value should return 204
+POST http://127.0.0.1:3000/org/acme/user/5
+Content-Type: application/json
+{
+  "name": "erin",
+  "role": "member",
+  "score": 6
+}
+HTTP 204
+
+# Timestamp should change after update
+POST http://127.0.0.1:3000/
+Content-Type: application/json
+{
+  "prefixes": ["org/acme/user/"],
+  "query": "inputs | select(._key == \"org/acme/user/5\") | ._at",
+  "from": 0
+}
+HTTP 200
+[Asserts]
+jsonpath "$[0]" != {{user5_before}}
+
 # Project multiple fields
 GET http://127.0.0.1:3000/user/?q={k:._key,r:.role}
 HTTP 200
@@ -109,7 +162,7 @@ Content-Type: application/json
 }
 HTTP 200
 [Asserts]
-jsonpath "$[0]" == 13
+jsonpath "$[0]" == 19
 
 # Aggregation with filter
 POST http://127.0.0.1:3000/
@@ -158,7 +211,7 @@ Content-Type: application/json
 }
 HTTP 200
 [Asserts]
-jsonpath "$[0]" == 1
+jsonpath "$[0]" == 2
 
 # Collect roles from users only
 POST http://127.0.0.1:3000/
@@ -192,6 +245,56 @@ GET http://127.0.0.1:3000/user/404
 HTTP 404
 [Asserts]
 jsonpath "$.code" == "not_found"
+
+# Invalid JSON body should return JSON error
+POST http://127.0.0.1:3000/
+Content-Type: application/json
+`{"prefixes":[`
+HTTP 400
+[Asserts]
+jsonpath "$.code" == "bad_request"
+
+# Missing fields should return JSON error
+POST http://127.0.0.1:3000/
+Content-Type: application/json
+{
+  "prefixes": ["user/"]
+}
+HTTP 400
+[Asserts]
+jsonpath "$.code" == "bad_request"
+
+# Invalid query via POST should return JSON error
+POST http://127.0.0.1:3000/
+Content-Type: application/json
+{
+  "prefixes": ["user/"],
+  "query": "bad(",
+  "from": 0
+}
+HTTP 400
+[Asserts]
+jsonpath "$.code" == "invalid_query"
+
+# Invalid JSON on key write should return JSON error
+POST http://127.0.0.1:3000/user/1
+Content-Type: application/json
+`{"name":`
+HTTP 400
+[Asserts]
+jsonpath "$.code" == "bad_request"
+
+# Missing key for delete should return JSON error
+DELETE http://127.0.0.1:3000/
+HTTP 400
+[Asserts]
+jsonpath "$.code" == "missing_key"
+
+# Method not allowed
+PUT http://127.0.0.1:3000/user/1
+HTTP 405
+[Asserts]
+jsonpath "$.code" == "method_not_allowed"
 
 # Invalid query should return JSON error
 GET http://127.0.0.1:3000/user/?q=bad(

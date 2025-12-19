@@ -433,7 +433,15 @@ async fn handle_request(
                 };
             }
             let k = percent_decode_str(key).decode_utf8_lossy();
-            let bytes = cbor::encode(&body)?;
+            let bytes = match cbor::encode(&body) {
+                Ok(v) => v,
+                Err(e) => {
+                    return Ok(res_error(ApiError::BadRequest(format!(
+                        "Invalid JSON body: {}",
+                        e
+                    ))));
+                }
+            };
             let count = lmdb::update_entry(&db, k.as_ref().as_bytes(), &bytes, None)?;
             let status = if count == 0 {
                 StatusCode::NOT_MODIFIED
