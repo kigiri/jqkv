@@ -23,7 +23,7 @@ use percent_encoding::percent_decode_str;
 use serde::Deserialize;
 use serde_json::{Value, json};
 use tokio::net::TcpListener;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 use url::form_urlencoded;
 
 mod cbor;
@@ -89,14 +89,18 @@ fn res_json(status: StatusCode, body: impl Into<Bytes>) -> Response<RespBody> {
 }
 
 fn res_error(err: ApiError) -> Response<RespBody> {
+    let body = error_body(&err);
+    res_json(err.status(), Bytes::from(body))
+}
+
+fn error_body(err: &ApiError) -> Vec<u8> {
     let payload = json!({
         "error": err.message(),
         "code": err.code(),
     });
-    let body = serde_json::to_vec(&payload).unwrap_or_else(|_| {
+    serde_json::to_vec(&payload).unwrap_or_else(|_| {
         b"{\"error\":\"Internal error\",\"code\":\"internal_error\"}".to_vec()
-    });
-    res_json(err.status(), Bytes::from(body))
+    })
 }
 
 fn res_empty(status: StatusCode) -> Response<RespBody> {
@@ -305,6 +309,7 @@ async fn handle_request(
                 let prefix_bytes = Bytes::copy_from_slice(prefix);
 
                 let (tx, rx) = mpsc::channel::<Bytes>(32);
+                let (status_tx, status_rx) = oneshot::channel::<Result<(), ApiError>>();
 
                 tokio::task::spawn_blocking(move || {
                     let params: HashMap<String, String> =
@@ -325,18 +330,13 @@ async fn handle_request(
                         Ok(f) => f,
                         Err(err) => {
                             let api_err = ApiError::InvalidQuery(err);
-                            let payload = json!({
-                                "error": api_err.message(),
-                                "code": api_err.code(),
-                            });
-                            let body = serde_json::to_vec(&payload).unwrap_or_else(|_| {
-                                b"{\"error\":\"Internal error\",\"code\":\"internal_error\"}"
-                                    .to_vec()
-                            });
+                            let body = error_body(&api_err);
+                            let _ = status_tx.send(Err(api_err));
                             let _ = tx.blocking_send(Bytes::from(body));
                             return;
                         }
                     };
+                    let _ = status_tx.send(Ok(()));
 
                     let mut output = StreamWriter::new(tx);
                     let mut arr = match JsonArrayWriter::new(&mut output) {
@@ -349,7 +349,17 @@ async fn handle_request(
                     let _ = output.flush();
                 });
 
-                Ok(set_json_header(Response::new(ChannelBody { rx }.boxed())))
+                match status_rx.await {
+                    Ok(Ok(())) => Ok(set_json_header(Response::new(ChannelBody { rx }.boxed()))),
+                    Ok(Err(api_err)) => {
+                        let mut r = Response::new(ChannelBody { rx }.boxed());
+                        *r.status_mut() = api_err.status();
+                        Ok(set_json_header(r))
+                    }
+                    Err(_) => Ok(res_error(ApiError::Internal(
+                        "worker error".to_string(),
+                    ))),
+                }
             }
         }
         Method::POST => {
@@ -368,6 +378,7 @@ async fn handle_request(
                 };
 
                 let (tx, rx) = mpsc::channel::<Bytes>(32);
+                let (status_tx, status_rx) = oneshot::channel::<Result<(), ApiError>>();
 
                 tokio::task::spawn_blocking(move || {
                     let query = normalize_query(&parsed.query);
@@ -376,18 +387,13 @@ async fn handle_request(
                         Ok(f) => f,
                         Err(err) => {
                             let api_err = ApiError::InvalidQuery(err);
-                            let payload = json!({
-                                "error": api_err.message(),
-                                "code": api_err.code(),
-                            });
-                            let body = serde_json::to_vec(&payload).unwrap_or_else(|_| {
-                                b"{\"error\":\"Internal error\",\"code\":\"internal_error\"}"
-                                    .to_vec()
-                            });
+                            let body = error_body(&api_err);
+                            let _ = status_tx.send(Err(api_err));
                             let _ = tx.blocking_send(Bytes::from(body));
                             return;
                         }
                     };
+                    let _ = status_tx.send(Ok(()));
 
                     let mut output = StreamWriter::new(tx);
                     let mut arr = match JsonArrayWriter::new(&mut output) {
@@ -413,7 +419,17 @@ async fn handle_request(
                     let _ = output.flush();
                 });
 
-                return Ok(set_json_header(Response::new(ChannelBody { rx }.boxed())));
+                return match status_rx.await {
+                    Ok(Ok(())) => Ok(set_json_header(Response::new(ChannelBody { rx }.boxed()))),
+                    Ok(Err(api_err)) => {
+                        let mut r = Response::new(ChannelBody { rx }.boxed());
+                        *r.status_mut() = api_err.status();
+                        Ok(set_json_header(r))
+                    }
+                    Err(_) => Ok(res_error(ApiError::Internal(
+                        "worker error".to_string(),
+                    ))),
+                };
             }
             let k = percent_decode_str(key).decode_utf8_lossy();
             let bytes = cbor::encode(&body)?;
