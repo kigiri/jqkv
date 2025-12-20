@@ -18,6 +18,7 @@ pub enum ApiError {
     Internal(String),
     MethodNotAllowed,
     MissingKey,
+    PayloadTooLarge(String),
 }
 
 impl ApiError {
@@ -37,6 +38,11 @@ impl ApiError {
                 "Method Not Allowed",
             ),
             ApiError::MissingKey => (hyper::StatusCode::BAD_REQUEST, "missing_key", "Missing key"),
+            ApiError::PayloadTooLarge(msg) => (
+                hyper::StatusCode::PAYLOAD_TOO_LARGE,
+                "payload_too_large",
+                msg,
+            ),
         }
     }
 }

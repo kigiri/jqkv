@@ -296,6 +296,14 @@ HTTP 405
 [Asserts]
 jsonpath "$.code" == "method_not_allowed"
 
+# Payload too large
+POST http://127.0.0.1:3000/user/1
+Content-Type: application/octet-stream
+file, tests/hurl/payloads/large.bin;
+HTTP 413
+[Asserts]
+jsonpath "$.code" == "payload_too_large"
+
 # Invalid query should return JSON error
 GET http://127.0.0.1:3000/user/?q=bad(
 HTTP 400

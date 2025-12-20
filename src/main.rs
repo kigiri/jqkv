@@ -5,13 +5,14 @@ use std::io::Write;
 use std::path::Path;
 use std::pin::Pin;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::task::{Context, Poll};
 use std::time::Instant;
 
 use http_body_util::combinators::BoxBody;
-use http_body_util::{BodyExt, Full};
+use http_body_util::{BodyExt, Full, LengthLimitError, Limited};
 use hyper::body::{Bytes, Frame};
-use hyper::header::CONTENT_TYPE;
+use hyper::header::{CONTENT_LENGTH, CONTENT_TYPE};
 use hyper::service::service_fn;
 use hyper::{Method, Request, Response, StatusCode};
 use hyper_util::rt::TokioIo;
@@ -106,6 +107,24 @@ fn handle_service_error(err: service::ApiError) -> Result<Response<RespBody>, se
     }
 }
 
+const DEFAULT_MAX_BODY_BYTES: usize = 1_048_576;
+static MAX_BODY_BYTES: AtomicUsize = AtomicUsize::new(DEFAULT_MAX_BODY_BYTES);
+
+fn payload_too_large(limit: usize) -> service::ApiError {
+    service::ApiError::PayloadTooLarge(format!(
+        "Payload too large (max {} bytes)",
+        limit
+    ))
+}
+
+async fn drain_body(mut body: hyper::body::Incoming) {
+    while let Some(frame) = body.frame().await {
+        if frame.is_err() {
+            break;
+        }
+    }
+}
+
 async fn run_streamed_query(
     db: Arc<lmdb::DB>,
     prefixes: Vec<Bytes>,
@@ -185,12 +204,28 @@ async fn handle_request(
             }
         }
         Method::POST => {
-            let c = req
-                .into_body()
-                .collect()
-                .await
-                .map_err(|e| service::ApiError::Internal(format!("body collect: {}", e)))?;
-            let body = c.to_bytes();
+            let limit = MAX_BODY_BYTES.load(Ordering::Relaxed);
+            if let Some(len) = req.headers().get(CONTENT_LENGTH)
+                && let Ok(len_str) = len.to_str()
+                && let Ok(len_val) = len_str.parse::<usize>()
+                && len_val > limit
+            {
+                let body = req.into_body();
+                // we drain the body to avoid broken pipe errors from clients
+                drain_body(body).await;
+                return Ok(res_error(payload_too_large(limit)));
+            }
+            let limited = Limited::new(req.into_body(), limit);
+            let collected = match limited.collect().await {
+                Ok(c) => c,
+                Err(err) => {
+                    if err.downcast_ref::<LengthLimitError>().is_some() {
+                        return Ok(res_error(payload_too_large(limit)));
+                    }
+                    return Err(service::ApiError::Internal(format!("body collect: {}", err)));
+                }
+            };
+            let body = collected.to_bytes();
             if key.is_empty() {
                 let parsed = match serde_json::from_slice::<ParseBody>(&body) {
                     Ok(p) => p,
@@ -276,6 +311,11 @@ where
 
 #[tokio::main]
 async fn main() -> AppResult<()> {
+    if let Ok(val) = std::env::var("STORE_MAX_BODY_BYTES")
+        && let Ok(parsed) = val.parse::<usize>()
+    {
+        MAX_BODY_BYTES.store(parsed, Ordering::Relaxed);
+    }
     let db_path = std::env::var("STORE_DB_PATH").ok();
     let db = match db_path.as_deref() {
         Some(path) => Arc::new(
@@ -283,7 +323,11 @@ async fn main() -> AppResult<()> {
         ),
         None => Arc::new(lmdb::DB::new().expect("Unable to init the database")),
     };
-    let addr = SocketAddr::from(([127, 0, 0, 1], 3000));
+    let port = std::env::var("STORE_PORT")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(3000);
+    let addr = SocketAddr::from(([127, 0, 0, 1], port));
     let listener = TcpListener::bind(addr).await?;
     loop {
         let (stream, _) = listener.accept().await?;
