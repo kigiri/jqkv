@@ -20,6 +20,27 @@ pub enum ApiError {
     MissingKey,
 }
 
+impl ApiError {
+    pub fn describe(&self) -> (hyper::StatusCode, &'static str, &str) {
+        match self {
+            ApiError::NotFound => (hyper::StatusCode::NOT_FOUND, "not_found", "Not Found"),
+            ApiError::BadRequest(msg) => (hyper::StatusCode::BAD_REQUEST, "bad_request", msg),
+            ApiError::InvalidQuery(msg) => {
+                (hyper::StatusCode::BAD_REQUEST, "invalid_query", msg)
+            }
+            ApiError::Internal(msg) => {
+                (hyper::StatusCode::INTERNAL_SERVER_ERROR, "internal_error", msg)
+            }
+            ApiError::MethodNotAllowed => (
+                hyper::StatusCode::METHOD_NOT_ALLOWED,
+                "method_not_allowed",
+                "Method Not Allowed",
+            ),
+            ApiError::MissingKey => (hyper::StatusCode::BAD_REQUEST, "missing_key", "Missing key"),
+        }
+    }
+}
+
 pub enum UpdateResult {
     Unchanged,
     Updated,

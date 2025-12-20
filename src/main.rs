@@ -62,39 +62,6 @@ struct ParseBody {
     from: f64,
 }
 
-fn error_status(err: &service::ApiError) -> StatusCode {
-    match err {
-        service::ApiError::NotFound => StatusCode::NOT_FOUND,
-        service::ApiError::BadRequest(_) => StatusCode::BAD_REQUEST,
-        service::ApiError::InvalidQuery(_) => StatusCode::BAD_REQUEST,
-        service::ApiError::Internal(_) => StatusCode::INTERNAL_SERVER_ERROR,
-        service::ApiError::MethodNotAllowed => StatusCode::METHOD_NOT_ALLOWED,
-        service::ApiError::MissingKey => StatusCode::BAD_REQUEST,
-    }
-}
-
-fn error_code(err: &service::ApiError) -> &'static str {
-    match err {
-        service::ApiError::NotFound => "not_found",
-        service::ApiError::BadRequest(_) => "bad_request",
-        service::ApiError::InvalidQuery(_) => "invalid_query",
-        service::ApiError::Internal(_) => "internal_error",
-        service::ApiError::MethodNotAllowed => "method_not_allowed",
-        service::ApiError::MissingKey => "missing_key",
-    }
-}
-
-fn error_message(err: &service::ApiError) -> &str {
-    match err {
-        service::ApiError::NotFound => "Not Found",
-        service::ApiError::BadRequest(msg) => msg,
-        service::ApiError::InvalidQuery(msg) => msg,
-        service::ApiError::Internal(msg) => msg,
-        service::ApiError::MethodNotAllowed => "Method Not Allowed",
-        service::ApiError::MissingKey => "Missing key",
-    }
-}
-
 fn res_json(status: StatusCode, body: impl Into<Bytes>) -> Response<RespBody> {
     let message = body.into();
     let mut r = Response::new(Full::new(message).boxed());
@@ -105,8 +72,9 @@ fn res_json(status: StatusCode, body: impl Into<Bytes>) -> Response<RespBody> {
 }
 
 fn res_error(err: service::ApiError) -> Response<RespBody> {
-    let body = error_body(&err);
-    res_json(error_status(&err), Bytes::from(body))
+    let (status, code, message) = err.describe();
+    let body = error_body(code, message);
+    res_json(status, Bytes::from(body))
 }
 
 fn res_empty(status: StatusCode) -> Response<RespBody> {
@@ -121,10 +89,10 @@ fn set_json_header(mut r: Response<RespBody>) -> Response<RespBody> {
     r
 }
 
-fn error_body(err: &service::ApiError) -> Vec<u8> {
+fn error_body(code: &str, message: &str) -> Vec<u8> {
     let payload = json!({
-        "error": error_message(err),
-        "code": error_code(err),
+        "error": message,
+        "code": code,
     });
     serde_json::to_vec(&payload).unwrap_or_else(|_| {
         b"{\"error\":\"Internal error\",\"code\":\"internal_error\"}".to_vec()
@@ -164,7 +132,8 @@ async fn run_streamed_query(
         );
         if let Err(err) = result {
             if let Some(tx) = status_tx.take() {
-                let body = error_body(&err);
+                let (_status, code, message) = err.describe();
+                let body = error_body(code, message);
                 let _ = tx.send(Err(err));
                 let _ = output.write_all(&body);
                 let _ = output.flush();
