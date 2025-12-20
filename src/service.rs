@@ -48,12 +48,11 @@ pub enum UpdateResult {
 
 pub fn get_value_json(db: &lmdb::DB, key: &[u8]) -> Result<Option<Vec<u8>>, ApiError> {
     let txn = db
-        .env
         .read_txn()
         .map_err(|e| ApiError::Internal(format!("read_txn: {}", e)))?;
     let val = db
         .data
-        .get(&txn, key)
+        .get(&txn.txn, key)
         .map_err(|e| ApiError::Internal(format!("data.get: {}", e)))?;
     match val {
         None => Ok(None),
@@ -129,12 +128,11 @@ where
     W: Write,
 {
     let txn = db
-        .env
         .read_txn()
         .map_err(|e| ApiError::Internal(format!("read_txn: {}", e)))?;
     let iter = db
         .meta
-        .prefix_iter(&txn, &prefix)
+        .prefix_iter(&txn.txn, &prefix)
         .map_err(|e| ApiError::Internal(format!("meta.prefix_iter: {}", e)))?;
     let max = (from * 1_000_000.0) as u64;
     let row_iter = iter.flatten().filter_map(|(k, at)| {
@@ -142,7 +140,7 @@ where
             return None;
         }
 
-        let bytes_opt = match db.data.get(&txn, &k) {
+        let bytes_opt = match db.data.get(&txn.txn, &k) {
             Ok(b) => b,
             Err(e) => return Some(Err(format!("data.get error: {}", e))),
         };
