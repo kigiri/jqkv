@@ -4,7 +4,8 @@ unsafe extern "C" {}
 
 use ::std::time::*;
 use heed::{
-    BoxedError, BytesDecode, BytesEncode, Database, Env, EnvOpenOptions,
+    BoxedError, BytesDecode, BytesEncode, Database, Env, EnvOpenOptions, Error as HeedError,
+    MdbError,
     byteorder::BigEndian,
     types::{Bytes, U64},
 };
@@ -60,19 +61,40 @@ pub fn update_entry(
         Some(ts) => (ts * 1_000_000.0) as u64,
         None => SystemTime::now().duration_since(UNIX_EPOCH)?.as_micros() as u64,
     };
-    let mut wtxn = db.env.write_txn()?;
-    if let Some(existing_bytes) = db.data.get(&wtxn, key)? {
-        // No changes, nothing to do (compare compressed bytes)
-        if existing_bytes == value {
+    for _ in 0..3 {
+        let mut wtxn = db.env.write_txn()?;
+        if let Some(existing_bytes) = db.data.get(&wtxn, key)? {
+            // No changes, nothing to do (compare compressed bytes)
+            if existing_bytes == value {
+                wtxn.abort();
+                return Ok(0);
+            }
+        }
+        if let Err(err) = db.data.put(&mut wtxn, key, value) {
             wtxn.abort();
-            return Ok(0);
+            if try_resize_map(&db.env, &err) {
+                continue;
+            }
+            return Err(err.into());
+        }
+        if let Err(err) = db.meta.put(&mut wtxn, key, &now) {
+            wtxn.abort();
+            if try_resize_map(&db.env, &err) {
+                continue;
+            }
+            return Err(err.into());
+        }
+        match wtxn.commit() {
+            Ok(()) => return Ok(now),
+            Err(err) => {
+                if try_resize_map(&db.env, &err) {
+                    continue;
+                }
+                return Err(err.into());
+            }
         }
     }
-
-    db.data.put(&mut wtxn, key, value)?;
-    db.meta.put(&mut wtxn, key, &now)?;
-    wtxn.commit()?;
-    Ok(now)
+    Err("lmdb map resize failed after retries".into())
 }
 
 pub fn delete_entry(
@@ -84,6 +106,18 @@ pub fn delete_entry(
     db.meta.delete(&mut wtxn, key)?;
     wtxn.commit()?;
     Ok(1)
+}
+
+fn try_resize_map(env: &Env, err: &HeedError) -> bool {
+    if !matches!(err, HeedError::Mdb(MdbError::MapFull)) {
+        return false;
+    }
+    let current = env.info().map_size;
+    let new_size = current.saturating_mul(2);
+    if new_size <= current {
+        return false;
+    }
+    unsafe { env.resize(new_size) }.is_ok()
 }
 
 impl BytesEncode<'_> for RawKeyCodec {
