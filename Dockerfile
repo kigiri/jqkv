@@ -1,4 +1,4 @@
-FROM rust:1.85-slim-bookworm AS build
+FROM rustlang/rust:nightly-bookworm-slim AS build
 
 WORKDIR /app
 
@@ -18,10 +18,6 @@ FROM scratch
 WORKDIR /app
 
 COPY --from=build /app/target/x86_64-unknown-linux-musl/release/store /app/store
-
-ENV STORE_DB_PATH=/data \
-    STORE_PORT=3000 \
-    STORE_MAX_BODY_BYTES=1048576
 
 VOLUME ["/data"]
 
