@@ -1,44 +1,67 @@
-# Simple K/V json store with JQ as query language
+# jqkv
 
-the plan:
-- JQ query syntax for a LMDB kv store over an API.
+HTTP key/value store backed by LMDB with JaQ queries over JSON.
 
-why rust:
-- low memory footprint
-- good performances
-- has good bindings for LMDB and jaq as JQ rust native alternative
-- Good featurefull http servers (hyper)
+## Features
+- Stores JSON values (encoded as CBOR in LMDB).
+- Query over a key prefix or full DB using JaQ filters.
+- Streaming JSON array responses.
+- Metadata fields added to query inputs: `_key` (string), `_at` (unix seconds).
 
-## TODO
-### mini
-- [x] parse a JQ query over a bunch of lines of json
-- [x] load a LMDB database
-- [x] function to insert data (with metadata) in LMDB
-- [x] populate a test LMDB file with JSON and run JQ over it (output in std)
-- [x] put all the logic behind a single route with hyper
-- [ ] some kind of security 
-### pro
-- [x] Use the metadata table for time based filtering
-- [x] add tokio thread for blocking long queries
-- [ ] stream the response directly from jaq to the response
-- [x] basic pre-filtering based on key prefix (should be easy, lmdb feature)
-- [ ] regex pre-filtering on keys
-- [ ] some kind of polling or something to trigger updates over SSR
-- [ ] handle pagination with a CURSOR (not sure the proper way to do this, hold for the query for a bit ?)
-- [x] `messagepack` or `cbor` support (messagepack smaller, simpler, cbor native support in jaq)
-- [x] ~~lmdb compression (lz4-hc)~~ 30% slower for only 20% smaller
-- [ ] Explore compression on the whole db level, if possible would probably do a much better difference.
-- [ ] add a cache to avoid re-parsing JQ on every queries for common queries (not a big cost)
-- [ ] Set etag using the metadata db
-- [x] add route to get a single element from it's id
-- [ ] Limit upload size to something reasonable (?)
-- [ ] improve time range performances
-  - [ ] move the "meta" timestamp to a data prefix
-  - [ ] create a index by timestamp to be able to range on time
-### max
-- [ ] default web UI to explore the data
-- [ ] generate keys prefixes
-- [ ] generate matching schemas
-- [ ] llm / language server style auto-complete on the webUI query builder
-- [ ] update jaq to new version once it's stabilize and use first class cbor support (if this allow lazy access to values and avoid reading the whole buffer if we don't need to, this could be the biggest improvement)
-- [ ] make sure we only do the work we need for big queries (big speed ups)
+## API
+All responses are JSON. Errors return `{"error":"...","code":"..."}`.
+
+### GET /{key}
+Fetch a single value by key.
+
+### GET /?q=...&from=...
+Run a query over all keys. `q` defaults to `.`. `from` is unix seconds (float).
+
+### GET /{prefix}/?q=...&from=...
+Run a query over keys with the given prefix. The prefix must end with `/`.
+
+### POST /{key}
+Upsert a JSON value at the key. Returns `204` on change, `304` if unchanged.
+
+### POST /
+Run a query with a JSON body:
+```json
+{
+  "prefixes": ["logs/", "users/"],
+  "query": ".field",
+  "from": 0
+}
+```
+`from` is optional (defaults to `0`).
+
+### DELETE /{key}
+Delete a key. Returns `204`.
+
+## Query notes
+- If the query does not contain `inputs`, the server runs `inputs | <query>`.
+- Each input is a JSON object with `_key` and `_at` added.
+
+## Configuration
+- `STORE_PORT` (default: `3000`)
+- `STORE_DB_PATH` (default: `cache`)
+- `STORE_MAX_BODY_BYTES` (default: `1048576`)
+
+The server binds to `127.0.0.1:<PORT>`.
+
+## Build and run
+```
+cargo build
+cargo run
+```
+
+## Docker
+The server binds to `127.0.0.1`, so port publishing will not expose it outside the container.
+Use host networking or change the bind address in code.
+
+```
+docker build -t jqkv .
+docker run --rm --network host \
+  -e STORE_DB_PATH=/data \
+  -v $(pwd)/cache:/data \
+  jqkv
+```
