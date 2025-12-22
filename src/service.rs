@@ -19,6 +19,7 @@ pub enum ApiError {
     MethodNotAllowed,
     MissingKey,
     PayloadTooLarge(String),
+    Unauthorized,
 }
 
 impl ApiError {
@@ -42,6 +43,11 @@ impl ApiError {
                 hyper::StatusCode::PAYLOAD_TOO_LARGE,
                 "payload_too_large",
                 msg,
+            ),
+            ApiError::Unauthorized => (
+                hyper::StatusCode::UNAUTHORIZED,
+                "unauthorized",
+                "Unauthorized",
             ),
         }
     }

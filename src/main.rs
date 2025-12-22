@@ -4,7 +4,7 @@ use std::net::SocketAddr;
 use std::io::Write;
 use std::path::Path;
 use std::pin::Pin;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::task::{Context, Poll};
 use std::time::Instant;
@@ -12,7 +12,7 @@ use std::time::Instant;
 use http_body_util::combinators::BoxBody;
 use http_body_util::{BodyExt, Full, LengthLimitError, Limited};
 use hyper::body::{Bytes, Frame};
-use hyper::header::{CONTENT_LENGTH, CONTENT_TYPE};
+use hyper::header::{AUTHORIZATION, CONTENT_LENGTH, CONTENT_TYPE};
 use hyper::service::service_fn;
 use hyper::{Method, Request, Response, StatusCode};
 use hyper_util::rt::TokioIo;
@@ -109,6 +109,7 @@ fn handle_service_error(err: service::ApiError) -> Result<Response<RespBody>, se
 
 const DEFAULT_MAX_BODY_BYTES: usize = 1_048_576;
 static MAX_BODY_BYTES: AtomicUsize = AtomicUsize::new(DEFAULT_MAX_BODY_BYTES);
+static API_KEY: OnceLock<Option<String>> = OnceLock::new();
 
 fn payload_too_large(limit: usize) -> service::ApiError {
     service::ApiError::PayloadTooLarge(format!(
@@ -173,6 +174,9 @@ async fn handle_request(
     req: Request<hyper::body::Incoming>,
     db: Arc<lmdb::DB>,
 ) -> Result<Response<RespBody>, service::ApiError> {
+    if !is_authorized(&req) {
+        return Ok(res_error(service::ApiError::Unauthorized));
+    }
     let path = req.uri().path().to_string();
     let key = path.strip_prefix('/').unwrap_or("");
     match *req.method() {
@@ -270,6 +274,38 @@ async fn handle_request(
     }
 }
 
+fn is_authorized(req: &Request<hyper::body::Incoming>) -> bool {
+    let expected = match API_KEY.get() {
+        Some(Some(val)) => val.as_str(),
+        _ => return true,
+    };
+
+    if let Some(value) = req
+        .headers()
+        .get(AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+    {
+        if value == expected {
+            return true;
+        }
+        if value.strip_prefix("Bearer ") == Some(expected) {
+            return true;
+        }
+    }
+
+    if req
+        .headers()
+        .get("x-api-key")
+        .and_then(|value| value.to_str().ok())
+        .map(|value| value == expected)
+        .unwrap_or(false)
+    {
+        return true;
+    }
+
+    false
+}
+
 async fn handler(
     req: Request<hyper::body::Incoming>,
     db: Arc<lmdb::DB>,
@@ -311,10 +347,18 @@ where
 
 #[tokio::main]
 async fn main() -> AppResult<()> {
-    if let Ok(val) = std::env::var("STORE_MAX_BODY_BYTES")
-        && let Ok(parsed) = val.parse::<usize>()
+    if let Some(parsed) = std::env::var("STORE_MAX_BODY_BYTES")
+        .ok()
+        .and_then(|val| val.parse::<usize>().ok())
     {
         MAX_BODY_BYTES.store(parsed, Ordering::Relaxed);
+    }
+    let api_key = std::env::var("STORE_API_KEY")
+        .ok()
+        .filter(|val| !val.is_empty());
+    let _ = API_KEY.set(api_key);
+    if API_KEY.get().and_then(|val| val.as_ref()).is_none() {
+        eprintln!("Warning: STORE_API_KEY is not set, auth is disabled");
     }
     let db_path = std::env::var("STORE_DB_PATH").ok();
     let db = match db_path.as_deref() {
@@ -327,8 +371,9 @@ async fn main() -> AppResult<()> {
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(3000);
-    let addr = SocketAddr::from(([127, 0, 0, 1], port));
+    let addr = SocketAddr::from(([0, 0, 0, 0], port));
     let listener = TcpListener::bind(addr).await?;
+    println!("Listening on http://{}", addr);
     loop {
         let (stream, _) = listener.accept().await?;
         let io = TokioIo::new(stream);

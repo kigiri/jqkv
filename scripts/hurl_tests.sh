@@ -28,5 +28,5 @@ for _ in $(seq 1 50); do
   sleep 0.1
 done
 
-hurl --test --jobs 10 --file-root "$ROOT" "$ROOT/tests/hurl/basic.hurl"
+hurl --test --jobs 10 --file-root "/" "$ROOT/tests/hurl/basic.hurl"
 hurl --test "$ROOT/tests/hurl/cleanup.hurl"

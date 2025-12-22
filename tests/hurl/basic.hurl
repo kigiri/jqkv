@@ -299,7 +299,7 @@ jsonpath "$.code" == "method_not_allowed"
 # Payload too large
 POST http://127.0.0.1:3000/user/1
 Content-Type: application/octet-stream
-file, tests/hurl/payloads/large.bin;
+file, /tmp/jqkv-tests/large.bin;
 HTTP 413
 [Asserts]
 jsonpath "$.code" == "payload_too_large"

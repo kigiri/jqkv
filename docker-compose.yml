@@ -1,7 +1,7 @@
 services:
   jqkv:
-    build: .
-    image: ghcr.io/kigiri/jqkv
+    image: ghcr.io/kigiri/jqkv:sha-3a3d7b9
+    network_mode: host
     ports:
       - "${PORT:-3000}:3000"
     volumes:
@@ -10,6 +10,7 @@ services:
       STORE_DB_PATH: ${STORE_DB_PATH:-/data}
       STORE_PORT: ${PORT:-3000}
       STORE_MAX_BODY_BYTES: ${STORE_MAX_BODY_BYTES:-1048576}
+      STORE_API_KEY: ${STORE_API_KEY:-}
 
 volumes:
   jqkv-data:

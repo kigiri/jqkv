@@ -45,8 +45,15 @@ Delete a key. Returns `204`.
 - `STORE_PORT` (default: `3000`)
 - `STORE_DB_PATH` (default: `cache`)
 - `STORE_MAX_BODY_BYTES` (default: `1048576`)
+- `STORE_API_KEY` (optional; when set, all requests require auth)
 
 The server binds to `127.0.0.1:<PORT>`.
+
+## Authentication
+If `STORE_API_KEY` is set, every request must provide it via one of:
+- `Authorization: Bearer <key>`
+- `Authorization: <key>`
+- `X-API-Key: <key>`
 
 ## Build and run
 ```
