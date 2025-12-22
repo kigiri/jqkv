@@ -20,7 +20,10 @@ use hyper_util::server::conn::auto;
 use percent_encoding::percent_decode_str;
 use serde::Deserialize;
 use serde_json::json;
+use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::TcpListener;
+use tokio_openssl::SslStream;
+use openssl::ssl::{AlpnError, Ssl, SslAcceptor, SslFiletype, SslMethod, select_next_proto};
 use tokio::sync::{mpsc, oneshot};
 use url::form_urlencoded;
 
@@ -33,6 +36,11 @@ mod service;
 type RespBody = BoxBody<Bytes, Infallible>;
 type BoxError = Box<dyn std::error::Error + Send + Sync>;
 type AppResult<T> = std::result::Result<T, BoxError>;
+trait AsyncStream: AsyncRead + AsyncWrite + Unpin + Send {}
+
+impl<T> AsyncStream for T where T: AsyncRead + AsyncWrite + Unpin + Send {}
+
+type BoxedIo = Box<dyn AsyncStream>;
 
 struct ChannelBody {
     rx: tokio::sync::mpsc::Receiver<Bytes>,
@@ -306,6 +314,26 @@ fn is_authorized(req: &Request<hyper::body::Incoming>) -> bool {
     false
 }
 
+fn load_tls_acceptor() -> AppResult<Option<SslAcceptor>> {
+    let cert_path = std::env::var("STORE_TLS_CERT").ok();
+    let key_path = std::env::var("STORE_TLS_KEY").ok();
+
+    if cert_path.is_none() && key_path.is_none() {
+        return Ok(None);
+    }
+
+    let cert_path = cert_path.ok_or("STORE_TLS_CERT is required when TLS is enabled")?;
+    let key_path = key_path.ok_or("STORE_TLS_KEY is required when TLS is enabled")?;
+    let mut builder = SslAcceptor::mozilla_intermediate(SslMethod::tls())?;
+    builder.set_certificate_chain_file(cert_path)?;
+    builder.set_private_key_file(key_path, SslFiletype::PEM)?;
+    builder.set_alpn_select_callback(|_ssl, client| {
+        select_next_proto(b"\x02h2\x08http/1.1", client).ok_or(AlpnError::NOACK)
+    });
+
+    Ok(Some(builder.build()))
+}
+
 async fn handler(
     req: Request<hyper::body::Incoming>,
     db: Arc<lmdb::DB>,
@@ -360,6 +388,7 @@ async fn main() -> AppResult<()> {
     if API_KEY.get().and_then(|val| val.as_ref()).is_none() {
         eprintln!("Warning: STORE_API_KEY is not set, auth is disabled");
     }
+    let tls_acceptor = load_tls_acceptor()?;
     let db_path = std::env::var("STORE_DB_PATH").ok();
     let db = match db_path.as_deref() {
         Some(path) => Arc::new(
@@ -373,12 +402,37 @@ async fn main() -> AppResult<()> {
         .unwrap_or(3000);
     let addr = SocketAddr::from(([0, 0, 0, 0], port));
     let listener = TcpListener::bind(addr).await?;
-    println!("Listening on http://{}", addr);
+    let scheme = if tls_acceptor.is_some() { "https" } else { "http" };
+    println!("Listening on {}://{}", scheme, addr);
     loop {
         let (stream, _) = listener.accept().await?;
-        let io = TokioIo::new(stream);
         let db = db.clone();
+        let tls_acceptor = tls_acceptor.clone();
         tokio::task::spawn(async move {
+            let io: BoxedIo = if let Some(acceptor) = tls_acceptor {
+                let ssl = match Ssl::new(acceptor.context()) {
+                    Ok(ssl) => ssl,
+                    Err(err) => {
+                        eprintln!("TLS init error: {}", err);
+                        return;
+                    }
+                };
+                let mut tls_stream = match SslStream::new(ssl, stream) {
+                    Ok(stream) => stream,
+                    Err(err) => {
+                        eprintln!("TLS stream error: {}", err);
+                        return;
+                    }
+                };
+                if let Err(err) = Pin::new(&mut tls_stream).accept().await {
+                    eprintln!("TLS accept error: {}", err);
+                    return;
+                }
+                Box::new(tls_stream)
+            } else {
+                Box::new(stream)
+            };
+            let io = TokioIo::new(io);
             let svc = service_fn(move |req| {
                 println!("{}{}", req.method(), req.uri());
                 handler(req, db.clone())

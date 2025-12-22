@@ -1,5 +1,5 @@
 # Insert test data
-POST http://127.0.0.1:3000/user/1
+POST https://127.0.0.1:3000/user/1
 Content-Type: application/json
 {
   "name": "alice",
@@ -8,7 +8,7 @@ Content-Type: application/json
 }
 HTTP 204
 
-POST http://127.0.0.1:3000/user/2
+POST https://127.0.0.1:3000/user/2
 Content-Type: application/json
 {
   "name": "bob",
@@ -17,7 +17,7 @@ Content-Type: application/json
 }
 HTTP 204
 
-POST http://127.0.0.1:3000/group/alpha
+POST https://127.0.0.1:3000/group/alpha
 Content-Type: application/json
 {
   "name": "core-team",
@@ -25,7 +25,7 @@ Content-Type: application/json
 }
 HTTP 204
 
-POST http://127.0.0.1:3000/org/acme/user/3
+POST https://127.0.0.1:3000/org/acme/user/3
 Content-Type: application/json
 {
   "name": "cara",
@@ -34,7 +34,7 @@ Content-Type: application/json
 }
 HTTP 204
 
-POST http://127.0.0.1:3000/org/acme/user/4
+POST https://127.0.0.1:3000/org/acme/user/4
 Content-Type: application/json
 {
   "name": "dana",
@@ -43,7 +43,7 @@ Content-Type: application/json
 }
 HTTP 204
 
-POST http://127.0.0.1:3000/org/acme/user/5
+POST https://127.0.0.1:3000/org/acme/user/5
 Content-Type: application/json
 {
   "name": "erin",
@@ -52,7 +52,7 @@ Content-Type: application/json
 }
 HTTP 204
 
-POST http://127.0.0.1:3000/org/acme/group/ops
+POST https://127.0.0.1:3000/org/acme/group/ops
 Content-Type: application/json
 {
   "name": "ops",
@@ -60,14 +60,14 @@ Content-Type: application/json
 }
 HTTP 204
 
-POST http://127.0.0.1:3000/org/acme/user/1/message/1
+POST https://127.0.0.1:3000/org/acme/user/1/message/1
 Content-Type: application/json
 {
   "text": "hello"
 }
 HTTP 204
 
-POST http://127.0.0.1:3000/org/acme/user/1/message/2
+POST https://127.0.0.1:3000/org/acme/user/1/message/2
 Content-Type: application/json
 {
   "text": "bye"
@@ -75,27 +75,27 @@ Content-Type: application/json
 HTTP 204
 
 # Fetch a single key
-GET http://127.0.0.1:3000/user/1
+GET https://127.0.0.1:3000/user/1
 HTTP 200
 [Asserts]
 jsonpath "$.name" == "alice"
 jsonpath "$.role" == "admin"
 
 # Query by prefix
-GET http://127.0.0.1:3000/user/?q=._key
+GET https://127.0.0.1:3000/user/?q=._key
 HTTP 200
 [Asserts]
 jsonpath "$[0]" == "user/1"
 jsonpath "$[1]" == "user/2"
 
 # Nested group prefix query
-GET http://127.0.0.1:3000/org/acme/group/?q=._key
+GET https://127.0.0.1:3000/org/acme/group/?q=._key
 HTTP 200
 [Asserts]
 jsonpath "$[0]" == "org/acme/group/ops"
 
 # Unchanged update should return 304
-POST http://127.0.0.1:3000/org/acme/user/5
+POST https://127.0.0.1:3000/org/acme/user/5
 Content-Type: application/json
 {
   "name": "erin",
@@ -105,7 +105,7 @@ Content-Type: application/json
 HTTP 304
 
 # Capture timestamp before update
-POST http://127.0.0.1:3000/
+POST https://127.0.0.1:3000/
 Content-Type: application/json
 {
   "prefixes": ["org/acme/user/"],
@@ -117,7 +117,7 @@ HTTP 200
 user5_before: jsonpath "$[0]"
 
 # Updated value should return 204
-POST http://127.0.0.1:3000/org/acme/user/5
+POST https://127.0.0.1:3000/org/acme/user/5
 Content-Type: application/json
 {
   "name": "erin",
@@ -127,7 +127,7 @@ Content-Type: application/json
 HTTP 204
 
 # Timestamp should change after update
-POST http://127.0.0.1:3000/
+POST https://127.0.0.1:3000/
 Content-Type: application/json
 {
   "prefixes": ["org/acme/user/"],
@@ -139,21 +139,21 @@ HTTP 200
 jsonpath "$[0]" != {{user5_before}}
 
 # Project multiple fields
-GET http://127.0.0.1:3000/user/?q={k:._key,r:.role}
+GET https://127.0.0.1:3000/user/?q={k:._key,r:.role}
 HTTP 200
 [Asserts]
 jsonpath "$[0].k" == "user/1"
 jsonpath "$[0].r" == "admin"
 
 # Nested prefix query
-GET http://127.0.0.1:3000/org/acme/user/1/message/?q=.text
+GET https://127.0.0.1:3000/org/acme/user/1/message/?q=.text
 HTTP 200
 [Asserts]
 jsonpath "$[0]" == "hello"
 jsonpath "$[1]" == "bye"
 
 # Aggregation using inputs
-POST http://127.0.0.1:3000/
+POST https://127.0.0.1:3000/
 Content-Type: application/json
 {
   "prefixes": ["org/acme/user/"],
@@ -165,7 +165,7 @@ HTTP 200
 jsonpath "$[0]" == 19
 
 # Aggregation with filter
-POST http://127.0.0.1:3000/
+POST https://127.0.0.1:3000/
 Content-Type: application/json
 {
   "prefixes": ["org/acme/user/"],
@@ -177,7 +177,7 @@ HTTP 200
 jsonpath "$[0]" == 1
 
 # Filtered projection using inputs
-POST http://127.0.0.1:3000/
+POST https://127.0.0.1:3000/
 Content-Type: application/json
 {
   "prefixes": ["org/acme/user/"],
@@ -189,7 +189,7 @@ HTTP 200
 jsonpath "$[0]" == "dana"
 
 # Highest score user
-POST http://127.0.0.1:3000/
+POST https://127.0.0.1:3000/
 Content-Type: application/json
 {
   "prefixes": ["org/acme/user/"],
@@ -202,7 +202,7 @@ jsonpath "$[0].name" == "dana"
 jsonpath "$[0].score" == 9
 
 # Count users matching a filter
-POST http://127.0.0.1:3000/
+POST https://127.0.0.1:3000/
 Content-Type: application/json
 {
   "prefixes": ["org/acme/user/"],
@@ -214,7 +214,7 @@ HTTP 200
 jsonpath "$[0]" == 2
 
 # Collect roles from users only
-POST http://127.0.0.1:3000/
+POST https://127.0.0.1:3000/
 Content-Type: application/json
 {
   "prefixes": ["org/acme/user/"],
@@ -227,7 +227,7 @@ jsonpath "$[0]" == "member"
 jsonpath "$[1]" == "admin"
 
 # Multi-prefix search via POST /
-POST http://127.0.0.1:3000/
+POST https://127.0.0.1:3000/
 Content-Type: application/json
 {
   "prefixes": ["user/", "group/", "org/acme/"],
@@ -241,13 +241,13 @@ jsonpath "$[1]" == "user/2"
 jsonpath "$[2]" == "group/alpha"
 
 # Missing key should return JSON error
-GET http://127.0.0.1:3000/user/404
+GET https://127.0.0.1:3000/user/404
 HTTP 404
 [Asserts]
 jsonpath "$.code" == "not_found"
 
 # Invalid JSON body should return JSON error
-POST http://127.0.0.1:3000/
+POST https://127.0.0.1:3000/
 Content-Type: application/json
 `{"prefixes":[`
 HTTP 400
@@ -255,7 +255,7 @@ HTTP 400
 jsonpath "$.code" == "bad_request"
 
 # Missing fields should return JSON error
-POST http://127.0.0.1:3000/
+POST https://127.0.0.1:3000/
 Content-Type: application/json
 {
   "prefixes": ["user/"]
@@ -265,7 +265,7 @@ HTTP 400
 jsonpath "$.code" == "bad_request"
 
 # Invalid query via POST should return JSON error
-POST http://127.0.0.1:3000/
+POST https://127.0.0.1:3000/
 Content-Type: application/json
 {
   "prefixes": ["user/"],
@@ -277,7 +277,7 @@ HTTP 400
 jsonpath "$.code" == "invalid_query"
 
 # Invalid JSON on key write should return JSON error
-POST http://127.0.0.1:3000/user/1
+POST https://127.0.0.1:3000/user/1
 Content-Type: application/json
 `{"name":`
 HTTP 400
@@ -285,19 +285,19 @@ HTTP 400
 jsonpath "$.code" == "bad_request"
 
 # Missing key for delete should return JSON error
-DELETE http://127.0.0.1:3000/
+DELETE https://127.0.0.1:3000/
 HTTP 400
 [Asserts]
 jsonpath "$.code" == "missing_key"
 
 # Method not allowed
-PUT http://127.0.0.1:3000/user/1
+PUT https://127.0.0.1:3000/user/1
 HTTP 405
 [Asserts]
 jsonpath "$.code" == "method_not_allowed"
 
 # Payload too large
-POST http://127.0.0.1:3000/user/1
+POST https://127.0.0.1:3000/user/1
 Content-Type: application/octet-stream
 file, /tmp/jqkv-tests/large.bin;
 HTTP 413
@@ -305,7 +305,7 @@ HTTP 413
 jsonpath "$.code" == "payload_too_large"
 
 # Invalid query should return JSON error
-GET http://127.0.0.1:3000/user/?q=bad(
+GET https://127.0.0.1:3000/user/?q=bad(
 HTTP 400
 [Asserts]
 jsonpath "$.code" == "invalid_query"

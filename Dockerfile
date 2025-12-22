@@ -3,7 +3,7 @@ FROM rustlang/rust:nightly-bookworm-slim AS build
 WORKDIR /app
 
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends musl-tools ca-certificates \
+    && apt-get install -y --no-install-recommends musl-tools ca-certificates openssl perl build-essential \
     && rm -rf /var/lib/apt/lists/*
 
 RUN rustup target add x86_64-unknown-linux-musl
